@@ -8,11 +8,13 @@ import os
 import numpy as np
 from PIL import Image
 
-from cleverhans.attacks import FastGradientMethod
+from cleverhans.attacks import FastGradientMethod, optimize_linear
+from cleverhans.compat import softmax_cross_entropy_with_logits, reduce_sum, reduce_max
 from cleverhans.loss import CrossEntropy
-from cleverhans.utils_tf import model_eval, train
+from cleverhans.utils_tf import model_eval
+from cleverhans.train import train
+from IterativeModel import ModelBasicCNN
 
-from IterativeModel import IterativeModel
 
 def parse_disk_file(data_dir):
     assert os.path.exists(data_dir), data_dir
@@ -26,7 +28,7 @@ def parse_disk_file(data_dir):
         y[index][label] = 1.0
         raw_image = np.asarray(PIL.Image.open(data_dir + '/' + filename)).reshape((28, 28, 1))
         x[index] = raw_image
-    return x, y
+    return x.astype(np.float32), y.astype(np.float32)
 
 
 def get_mnist(data_dir, train_start=0,
@@ -48,18 +50,15 @@ NB_FILTERS = 64
 NB_CLASSES = 10
 
 # Session
-config_args = {}
+config_args = {'allow_soft_placement' : True}
 sess = tf.Session(config=tf.ConfigProto(**config_args))
 
-# New model
-#model1 = IterativeModel('model1', NB_CLASSES, NB_FILTERS, 'pure', 'model1_adv')
-#model1.checkpoint_path = 'model/NN_0/cp.ckpt'
+# Define input TF placeholder
+x = tf.placeholder(tf.float32, shape=(BATCH_SIZE, 28, 28, 1))
+y = tf.placeholder(tf.float32, shape=(BATCH_SIZE, 10))
 
-# Start training
-def train_model(model, save_model=False, generate_adv=False):
-    # Define input TF placeholder
-    x = tf.placeholder(tf.float32, shape=(None, 28, 28, 1))
-    y = tf.placeholder(tf.float32, shape=(None, 10))
+# Training function
+def train_model(model):
     # Load image from disk
     x_train, y_train, x_test, y_test = get_mnist(model.input_dir)
     # Train an MNIST model
@@ -70,6 +69,7 @@ def train_model(model, save_model=False, generate_adv=False):
     }
     eval_params = {'batch_size': BATCH_SIZE}
     rng = np.random.RandomState([2017, 8, 30])
+
     def do_eval(preds, x_set, y_set):
         acc = model_eval(sess, x, y, preds, x_set, y_set, args=eval_params)
         print('Test accuracy on train: %0.4f' % (acc))
@@ -80,43 +80,90 @@ def train_model(model, save_model=False, generate_adv=False):
     def evaluate():
         do_eval(preds, x_test, y_test)
 
-    train(sess, loss, x, y, x_train, y_train, evaluate=evaluate, args=train_params, rng=rng, var_list=model.get_params())
+    train(sess, loss, x_train, y_train, evaluate=evaluate, args=train_params, rng=rng)
     # Calculate training error
     do_eval(preds, x_train, y_train)
-    if save_model:
-        print('Saving model to: ' + model.checkpoint_path)
-        model.save_weights(model.checkpoint_path)
 
-    if generate_adv:
-        x_train_pure, y_train_pure, x_test_pure, y_test_pure = get_mnist('pure')
-        dir = model.output_dir
-        fgsm = FastGradientMethod(model)
-        fgsm_params = {
-            'eps': 0.3,
-            'clip_min': 0.,
-            'clip_max': 1.
-        }
-        if not os.path.exists(dir + '/train/'):
-            os.mkdir(dir + '/train/')
-        if not os.path.exists(dir + '/test/'):
-            os.mkdir(dir + '/test/')
-        for index in range(len(y_test)):
-            print('test ' + str(index))
-            x_ = x_test_pure[index]
-            label = np.argmax(y_test[index])
-            raw_data = (fgsm.generate_np(x_.reshape((1, 28, 28, 1)), **fgsm_params).reshape((28, 28)) * 255).astype(
-                'uint8')
-            im = Image.fromarray(raw_data, mode='P')
-            im.save(dir + 'test/' + str(label) + '_' + str(uuid.uuid4()) + '.png')
-        for index in range(len(y_train)):
-            print('train ' + str(index))
-            x_ = x_train_pure[index]
-            label = np.argmax(y_train[index])
-            raw_data = (fgsm.generate_np(x_.reshape((1, 28, 28, 1)), **fgsm_params).reshape((28, 28)) * 255).astype(
-                'uint8')
-            im = Image.fromarray(raw_data, mode='P')
-            im.save(dir + 'train/' + str(label) + '_' + str(uuid.uuid4()) + '.png')
 
-model1 = IterativeModel('model1', NB_CLASSES, NB_FILTERS, 'pure', 'model1_adv')
-model1.checkpoint_path = 'model/NN_0/cp.ckpt'
-train_model(model1)
+def eval_model(model, input_dir):
+    # Load image from disk
+    _, _, x_test, y_test = get_mnist(input_dir)
+    preds = model.get_logits(x)
+    loss = CrossEntropy(model, smoothing=0.1)
+    # Evaluate an MNIST model
+    eval_params = {'batch_size': BATCH_SIZE}
+    acc = model_eval(sess, x, y, preds, x_test, y_test, args=eval_params)
+    print('Test accuracy on train: %0.4f' % (acc))
+
+
+def save_model(model):
+    saver = tf.train.Saver()
+    print(model.checkpoint_path)
+    saver.save(sess, model.checkpoint_path)
+    print("Model saved to: {}".format(model.checkpoint_path))
+
+
+def load_model(path):
+    saver = tf.train.Saver()
+    print(path)
+    saver.restore(sess, path)
+    print("Model loaded from: {}".format(path))
+
+def generate_adv_model(model):
+    x_train_pure, y_train_pure, x_test_pure, y_test_pure = get_mnist('pure')
+    preds = model.get_logits(x)
+    dir = model.output_dir
+    fgsm = FastGradientMethod(model, sess=sess)
+    fgsm_params = {
+        'eps': 0.3,
+        'clip_min': 0.,
+        'clip_max': 1.
+    }
+    dir = 'data/' + dir
+    if not os.path.exists(dir + '/train/'):
+        os.mkdir(dir + '/train/')
+    if not os.path.exists(dir + '/test/'):
+        os.mkdir(dir + '/test/')
+    start = 0
+    end = start + 128
+    for index in range(len(y_test_pure) // 128):
+        print('test ' + str(index))
+        print('train ' + str(index))
+        x_ = x_test_pure[start:end] / 255
+        raw_data = (fgsm.generate_np(x_, **fgsm_params) * 255).reshape((128, 28, 28)).astype('uint8')
+        for slic in range(start, end):
+            if slic==len(y_test_pure):
+                break
+            im = Image.fromarray(raw_data[slic-start], mode='P')
+            label = np.argmax(y_test_pure[slic])
+            im.save(dir + '/test/' + str(label) + '_' + str(uuid.uuid4()) + '.png')
+        start += 128
+        end += 128
+
+    start = 0
+    end = start + 128
+    for index in range(len(y_train_pure) // 128):
+        print('train ' + str(index))
+        print(start, end)
+        x_ = x_train_pure[start:end] / 255
+        raw_data = (fgsm.generate_np(x_, **fgsm_params) * 255).reshape((128, 28, 28)).astype('uint8')
+        for slic in range(start, end):
+            if slic==len(y_train_pure):
+                break
+            im = Image.fromarray(raw_data[slic-start], mode='P')
+            label = np.argmax(y_train_pure[slic])
+            im.save(dir + '/train/' + str(label) + '_' + str(uuid.uuid4()) + '.png')
+        start += 128
+        end += 128
+
+
+# New model
+model = ModelBasicCNN('model1', NB_CLASSES, NB_FILTERS)
+model.checkpoint_path = 'model/NN_0/cp.ckpt'
+model.input_dir = 'pure'
+model.output_dir = 'model1_adv'
+# train_model(model)
+# save_model(model)
+load_model('model/NN_0/cp.ckpt')
+generate_adv_model(model)
+# eval_model(model, 'pure')

@@ -6,7 +6,6 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import functools
-from abc import ABC
 
 import tensorflow as tf
 
@@ -14,13 +13,12 @@ from cleverhans import initializers
 from cleverhans.model import Model
 
 
-class IterativeModel(Model, ABC):
-  def __init__(self, scope, nb_classes, nb_filters, input_dir, output_dir, **kwargs):
+class ModelBasicCNN(Model):
+  def __init__(self, scope, nb_classes, nb_filters, **kwargs):
     del kwargs
     Model.__init__(self, scope, nb_classes, locals())
     self.nb_filters = nb_filters
-    self.input_dir = input_dir
-    self.output_dir = output_dir
+
     # Do a dummy run of fprop to make sure the variables are created from
     # the start
     self.fprop(tf.placeholder(tf.float32, [128, 28, 28, 1]))
